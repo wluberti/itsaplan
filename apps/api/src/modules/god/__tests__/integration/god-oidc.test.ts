@@ -21,6 +21,11 @@ const credentials = {
   clientSecret: 'sh-secret',
 };
 
+const googleCredentials = {
+  clientId: 'google-client',
+  clientSecret: 'google-secret',
+};
+
 describe('god OIDC and password settings', () => {
   beforeEach(resetDb);
 
@@ -108,6 +113,24 @@ describe('god OIDC and password settings', () => {
     });
   });
 
+  describe('trusting provider emails', () => {
+    it('is off by default and round-trips', async () => {
+      const { god } = await setup();
+
+      expect((await god.api.god['auth-settings'].get()).data).toMatchObject({
+        trustProviderEmails: false,
+      });
+
+      const res = await god.api.god['auth-settings'].put({ trustProviderEmails: true });
+
+      expect(res.status).toBe(200);
+      expect(res.data).toMatchObject({ trustProviderEmails: true });
+      expect((await god.api.god['auth-settings'].get()).data).toMatchObject({
+        trustProviderEmails: true,
+      });
+    });
+  });
+
   describe('turning off password sign-in', () => {
     it('refuses while no single sign-on provider is configured', async () => {
       const { god } = await setup();
@@ -164,6 +187,34 @@ describe('god OIDC and password settings', () => {
 
       const config = await god.api['auth-config'].get();
       expect(config.data).toMatchObject({ oidc: false, oidcLabel: '', emailPassword: true });
+    });
+
+    it('refuses to disable the only usable OIDC provider', async () => {
+      const { god } = await setup();
+      await god.api.god['oidc-settings'].put({ ...credentials, enabled: true });
+      await god.api.god['auth-settings'].put({ emailPassword: false });
+
+      const res = await god.api.god['oidc-settings'].put({ enabled: false });
+
+      expect(res.status).toBe(400);
+      expect(res.error!.value).toMatchObject({
+        error: 'Enable password sign-in or another single sign-on provider first',
+      });
+      expect((await god.api.god['oidc-settings'].get()).data).toMatchObject({ enabled: true });
+    });
+
+    it('refuses to disable the only usable Google provider', async () => {
+      const { god } = await setup();
+      await god.api.god['google-settings'].put({ ...googleCredentials, enabled: true });
+      await god.api.god['auth-settings'].put({ emailPassword: false });
+
+      const res = await god.api.god['google-settings'].put({ enabled: false });
+
+      expect(res.status).toBe(400);
+      expect(res.error!.value).toMatchObject({
+        error: 'Enable password sign-in or another single sign-on provider first',
+      });
+      expect((await god.api.god['google-settings'].get()).data).toMatchObject({ enabled: true });
     });
   });
 });

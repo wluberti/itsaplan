@@ -47,3 +47,5 @@ coverage
 
 # Local volumes
 minio-data/
+postgres-data/
+db-backups/

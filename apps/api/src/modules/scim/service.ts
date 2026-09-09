@@ -2,8 +2,9 @@ import { db, aiAgent, projectMember, scimGroup, scimGroupMember, user } from '@r
 import { and, eq, inArray, notExists, sql } from 'drizzle-orm';
 import { generateUsername } from '@repo/auth';
 import { iso } from '#shared/lib';
-import { deleteInstanceUser } from '#modules/god/service';
+import { deleteAccount } from '#shared/account-deletion';
 import { countOwners } from '#modules/members/service';
+import { insertOwnedTeam } from '#modules/teams/service';
 import { ScimError, type ScimFilter, type ScimGroupRecord, type ScimUserRecord } from './resource';
 import { mappedProjectIds, reconcileProjects } from './reconcile';
 
@@ -156,22 +157,30 @@ export async function createScimUser(input: {
       .returning(userColumns);
     return toUserRecord(linked[0]!);
   }
-  const rows = await db
-    .insert(user)
-    .values({
-      id: crypto.randomUUID(),
-      email,
-      name: input.name,
-      emailVerified: true,
-      role: 'user',
-      active: input.active,
-      scimExternalId: input.externalId,
-      // The @mention handle, derived from the address the same way a sign-up
-      // derives it. The identity provider does not supply one.
-      username: await generateUsername(email),
-    })
-    .returning(userColumns);
-  return toUserRecord(rows[0]!);
+  // The @mention handle, derived from the address the same way a sign-up derives it.
+  // The identity provider does not supply one.
+  const username = await generateUsername(email);
+  const created = await db.transaction(async (tx) => {
+    const inserted = await tx
+      .insert(user)
+      .values({
+        id: crypto.randomUUID(),
+        email,
+        name: input.name,
+        emailVerified: true,
+        role: 'user',
+        active: input.active,
+        scimExternalId: input.externalId,
+        username,
+      })
+      .returning(userColumns);
+    const row = inserted[0]!;
+    // A project belongs to a team, so without one of its own the account could only
+    // work in the projects its groups grant, and creating a project would fail.
+    await insertOwnedTeam(tx, username, row.id);
+    return row;
+  });
+  return toUserRecord(created);
 }
 
 export async function updateScimUser(
@@ -277,7 +286,7 @@ export async function deleteScimUser(id: string): Promise<void> {
         'project over to another owner first.',
     );
   }
-  await deleteInstanceUser(id);
+  await deleteAccount(id);
 }
 
 // The projects this user owns alone. Deleting them would leave those projects with
@@ -369,44 +378,40 @@ export async function getScimGroup(id: string): Promise<ScimGroupRecord | null> 
   return (await toGroupRecords(rows))[0]!;
 }
 
-// Replaces a group's member list and reconciles every project the group grants
-// membership in. Passing `undefined` leaves the members alone.
-async function writeMembers(groupId: string, userIds: string[] | undefined): Promise<void> {
-  if (!userIds) return;
-  const unique = [...new Set(userIds)];
-  if (unique.length > 0) {
-    const known = await db.select({ id: user.id }).from(user).where(inArray(user.id, unique));
-    const missing = unique.filter((id) => !known.some((k) => k.id === id));
-    if (missing.length > 0) {
-      throw new ScimError(400, `Unknown member id(s): ${missing.join(', ')}`, 'invalidValue');
-    }
-  }
-  await db.transaction(async (tx) => {
-    await tx.delete(scimGroupMember).where(eq(scimGroupMember.groupId, groupId));
-    if (unique.length > 0) {
-      await tx.insert(scimGroupMember).values(unique.map((userId) => ({ groupId, userId })));
-    }
-  });
-}
-
 export async function createScimGroup(input: {
   displayName: string;
   externalId: string | null;
   members: string[];
 }): Promise<ScimGroupRecord> {
-  const existing = await db
-    .select({ id: scimGroup.id })
-    .from(scimGroup)
-    .where(eq(scimGroup.displayName, input.displayName));
-  if (existing.length > 0) {
-    throw new ScimError(409, `A group named '${input.displayName}' already exists`, 'uniqueness');
-  }
-  const rows = await db
-    .insert(scimGroup)
-    .values({ displayName: input.displayName, externalId: input.externalId })
-    .returning();
-  const created = rows[0]!;
-  await writeMembers(created.id, input.members);
+  const created = await db.transaction(async (tx) => {
+    const existing = await tx
+      .select({ id: scimGroup.id })
+      .from(scimGroup)
+      .where(eq(scimGroup.displayName, input.displayName));
+    if (existing.length > 0) {
+      throw new ScimError(409, `A group named '${input.displayName}' already exists`, 'uniqueness');
+    }
+    const members = [...new Set(input.members)];
+    if (members.length > 0) {
+      const known = await tx.select({ id: user.id }).from(user).where(inArray(user.id, members));
+      const knownIds = new Set(known.map((row) => row.id));
+      const missing = members.filter((id) => !knownIds.has(id));
+      if (missing.length > 0) {
+        throw new ScimError(400, `Unknown member id(s): ${missing.join(', ')}`, 'invalidValue');
+      }
+    }
+    const rows = await tx
+      .insert(scimGroup)
+      .values({ displayName: input.displayName, externalId: input.externalId })
+      .returning();
+    const group = rows[0]!;
+    if (members.length > 0) {
+      await tx
+        .insert(scimGroupMember)
+        .values(members.map((userId) => ({ groupId: group.id, userId })));
+    }
+    return group;
+  });
   await reconcileProjects(await mappedProjectIds(created.id));
   return (await getScimGroup(created.id))!;
 }
@@ -415,47 +420,50 @@ export async function updateScimGroup(
   id: string,
   patch: { displayName?: string; externalId?: string | null; members?: string[] },
 ): Promise<ScimGroupRecord | null> {
-  const found = await db.select({ id: scimGroup.id }).from(scimGroup).where(eq(scimGroup.id, id));
-  if (!found[0]) return null;
-  if (patch.displayName) {
-    const clash = await db
-      .select({ id: scimGroup.id })
-      .from(scimGroup)
-      .where(eq(scimGroup.displayName, patch.displayName));
-    if (clash[0] && clash[0].id !== id) {
-      throw new ScimError(409, `A group named '${patch.displayName}' already exists`, 'uniqueness');
+  const updated = await db.transaction(async (tx) => {
+    const found = await tx.select({ id: scimGroup.id }).from(scimGroup).where(eq(scimGroup.id, id));
+    if (!found[0]) return false;
+    if (patch.displayName) {
+      const clash = await tx
+        .select({ id: scimGroup.id })
+        .from(scimGroup)
+        .where(eq(scimGroup.displayName, patch.displayName));
+      if (clash[0] && clash[0].id !== id) {
+        throw new ScimError(
+          409,
+          `A group named '${patch.displayName}' already exists`,
+          'uniqueness',
+        );
+      }
     }
-  }
-  await db
-    .update(scimGroup)
-    .set({
-      ...(patch.displayName ? { displayName: patch.displayName } : {}),
-      ...(patch.externalId !== undefined ? { externalId: patch.externalId } : {}),
-      updatedAt: new Date(),
-    })
-    .where(eq(scimGroup.id, id));
-  await writeMembers(id, patch.members);
+    const members = patch.members ? [...new Set(patch.members)] : undefined;
+    if (members && members.length > 0) {
+      const known = await tx.select({ id: user.id }).from(user).where(inArray(user.id, members));
+      const knownIds = new Set(known.map((row) => row.id));
+      const missing = members.filter((userId) => !knownIds.has(userId));
+      if (missing.length > 0) {
+        throw new ScimError(400, `Unknown member id(s): ${missing.join(', ')}`, 'invalidValue');
+      }
+    }
+    await tx
+      .update(scimGroup)
+      .set({
+        ...(patch.displayName ? { displayName: patch.displayName } : {}),
+        ...(patch.externalId !== undefined ? { externalId: patch.externalId } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(scimGroup.id, id));
+    if (members) {
+      await tx.delete(scimGroupMember).where(eq(scimGroupMember.groupId, id));
+      if (members.length > 0) {
+        await tx.insert(scimGroupMember).values(members.map((userId) => ({ groupId: id, userId })));
+      }
+    }
+    return true;
+  });
+  if (!updated) return null;
   await reconcileProjects(await mappedProjectIds(id));
   return getScimGroup(id);
-}
-
-export async function addScimGroupMembers(groupId: string, userIds: string[]): Promise<void> {
-  const current = await db
-    .select({ userId: scimGroupMember.userId })
-    .from(scimGroupMember)
-    .where(eq(scimGroupMember.groupId, groupId));
-  await writeMembers(groupId, [...current.map((r) => r.userId), ...userIds]);
-}
-
-export async function removeScimGroupMembers(groupId: string, userIds: string[]): Promise<void> {
-  await db
-    .delete(scimGroupMember)
-    .where(
-      and(
-        eq(scimGroupMember.groupId, groupId),
-        inArray(scimGroupMember.userId, [...new Set(userIds)]),
-      ),
-    );
 }
 
 export async function deleteScimGroup(id: string): Promise<boolean> {

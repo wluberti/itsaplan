@@ -1,6 +1,19 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  api,
+  keepPreviousData,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
+import {
+  removeIssueDevelopmentLink,
+  listIssueDevelopmentRepositories,
+  listLinkablePullRequests,
+  listDevelopmentBranches,
+  linkIssueDevelopment,
+  createIssuePullRequest,
+} from '@/lib/api/endpoints/git';
+import {
   type BulkIssuePatch,
   type IssueFieldValueEntry,
   type IssueFieldValueInput,
@@ -9,7 +22,21 @@ import {
   type BoardIssue,
   type BoardIssues,
   type SubtaskDisposition,
-} from '@/lib/api';
+  getIssue,
+  listIssueCycles,
+  getIssueBySeq,
+  searchIssues,
+  updateIssue,
+  deleteIssue,
+  archiveIssue,
+  restoreIssue,
+  setFieldValue,
+  bulkUpdateIssues,
+  bulkAddLabels,
+  bulkArchiveIssues,
+  bulkDeleteIssues,
+  createIssue,
+} from '@/lib/api/endpoints/issues';
 import { qk } from '@/services/queryKeys';
 
 // Deleting or archiving one issue. `subtasks` says what happens to the subtasks
@@ -28,17 +55,80 @@ interface BulkRemoval {
 export function useIssueQuery(id: number | null) {
   return useQuery({
     queryKey: qk.issue(id ?? -1),
-    queryFn: () => api.getIssue(id!),
+    queryFn: () => getIssue(id!),
     enabled: id != null,
   });
 }
 
+export function useRemoveIssueDevelopmentLink(issueId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (linkId: number) => removeIssueDevelopmentLink(issueId, linkId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.issue(issueId) }),
+  });
+}
+
+export function useIssueDevelopmentRepositoriesQuery(issueId: number, enabled: boolean) {
+  return useQuery({
+    queryKey: qk.issueDevelopmentRepositories(issueId),
+    queryFn: () => listIssueDevelopmentRepositories(issueId),
+    enabled,
+  });
+}
+
+export function useLinkablePullRequestsQuery(
+  issueId: number,
+  repositoryId: number | null,
+  state: 'open' | 'all',
+  enabled: boolean,
+) {
+  return useInfiniteQuery({
+    queryKey: qk.issueDevelopmentPullRequests(issueId, repositoryId ?? -1, state),
+    queryFn: ({ pageParam }) =>
+      listLinkablePullRequests(issueId, repositoryId!, { state, page: pageParam }),
+    initialPageParam: 1,
+    getNextPageParam: (page) => page.nextPage ?? undefined,
+    enabled: enabled && repositoryId !== null,
+  });
+}
+
+export function useDevelopmentBranchesQuery(
+  issueId: number,
+  repositoryId: number | null,
+  enabled: boolean,
+) {
+  return useInfiniteQuery({
+    queryKey: qk.issueDevelopmentBranches(issueId, repositoryId ?? -1),
+    queryFn: ({ pageParam }) => listDevelopmentBranches(issueId, repositoryId!, pageParam),
+    initialPageParam: 1,
+    getNextPageParam: (page) => page.nextPage ?? undefined,
+    enabled: enabled && repositoryId !== null,
+  });
+}
+
+export function useLinkIssueDevelopment(issueId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { repositoryId: number; number: number }) =>
+      linkIssueDevelopment(issueId, input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.issue(issueId) }),
+  });
+}
+
+export function useCreateIssuePullRequest(issueId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: Parameters<typeof createIssuePullRequest>[1]) =>
+      createIssuePullRequest(issueId, input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.issue(issueId) }),
+  });
+}
 // The cycles an issue was planned into. Read only where the badge that shows them
 // is, so a project without cycles never asks for it.
 export function useIssueCyclesQuery(issueId: number) {
   return useQuery({
     queryKey: qk.issueCycles(issueId),
-    queryFn: () => api.listIssueCycles(issueId),
+    queryFn: () => listIssueCycles(issueId),
   });
 }
 
@@ -50,7 +140,7 @@ export function useIssueBySeqQuery(projectKey: string | null, seq: number | null
   return useQuery({
     queryKey: qk.issueBySeq(projectKey ?? '', seq ?? -1),
     queryFn: async () => {
-      const issue = await api.getIssueBySeq(projectKey!, seq!);
+      const issue = await getIssueBySeq(projectKey!, seq!);
       qc.setQueryData(qk.issue(issue.id), issue);
       return issue;
     },
@@ -70,7 +160,7 @@ export function useIssueSearchQuery(
   const term = q.trim();
   return useQuery({
     queryKey: qk.issueSearch(projectKey ?? '', term),
-    queryFn: () => api.searchIssues(projectKey!, { q: term, limit: 50 }),
+    queryFn: () => searchIssues(projectKey!, { q: term, limit: 50 }),
     enabled: opts.enabled && projectKey != null && term.length > 0,
     placeholderData: keepPreviousData,
   });
@@ -83,7 +173,7 @@ export function useIssueSearchQuery(
 export function useUpdateIssue(projectKey: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, patch }: { id: number; patch: IssuePatch }) => api.updateIssue(id, patch),
+    mutationFn: ({ id, patch }: { id: number; patch: IssuePatch }) => updateIssue(id, patch),
     onMutate: async ({ id, patch }) => {
       if (!projectKey) return {};
       const key = qk.boardIssues(projectKey);
@@ -126,7 +216,7 @@ function invalidateGroupings(qc: ReturnType<typeof useQueryClient>) {
 export function useDeleteIssue(projectKey: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, subtasks }: IssueRemoval) => api.deleteIssue(id, subtasks),
+    mutationFn: ({ id, subtasks }: IssueRemoval) => deleteIssue(id, subtasks),
     onSuccess: async (_data, { id }) => {
       if (projectKey) {
         // Cancel any project fetch already in flight before removing the issue
@@ -154,7 +244,7 @@ export function useDeleteIssue(projectKey: string | null) {
 export function useArchiveIssue(projectKey: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, subtasks }: IssueRemoval) => api.archiveIssue(id, subtasks),
+    mutationFn: ({ id, subtasks }: IssueRemoval) => archiveIssue(id, subtasks),
     onSuccess: async (_data, { id }) => {
       if (projectKey) {
         await qc.cancelQueries({ queryKey: qk.boardIssues(projectKey) });
@@ -176,7 +266,7 @@ export function useArchiveIssue(projectKey: string | null) {
 export function useRestoreIssue(projectKey: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: number) => api.restoreIssue(id),
+    mutationFn: (id: number) => restoreIssue(id),
     onSuccess: (_data, id) => {
       if (projectKey) {
         void qc.invalidateQueries({ queryKey: qk.boardIssues(projectKey) });
@@ -220,7 +310,7 @@ export function useSetFieldValue(projectKey: string | null) {
       issueId: number;
       fieldId: number;
       value: IssueFieldValueInput;
-    }) => api.setFieldValue(issueId, fieldId, value),
+    }) => setFieldValue(issueId, fieldId, value),
     onMutate: async ({ issueId, fieldId, value }) => {
       if (!projectKey) return {};
       const key = qk.boardIssues(projectKey);
@@ -259,7 +349,7 @@ export function useBulkUpdateIssues(projectKey: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ ids, patch }: { ids: number[]; patch: BulkIssuePatch }) =>
-      api.bulkUpdateIssues(projectKey, ids, patch),
+      bulkUpdateIssues(projectKey, ids, patch),
     onMutate: async ({ ids, patch }) => {
       const key = qk.boardIssues(projectKey);
       await qc.cancelQueries({ queryKey: key });
@@ -289,7 +379,7 @@ export function useBulkAddLabels(projectKey: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ ids, add }: { ids: number[]; add: number[] }) =>
-      api.bulkAddLabels(projectKey, ids, add),
+      bulkAddLabels(projectKey, ids, add),
     onMutate: async ({ ids, add }) => {
       const key = qk.boardIssues(projectKey);
       await qc.cancelQueries({ queryKey: key });
@@ -344,21 +434,19 @@ function useBulkRemoval(
 
 export function useBulkArchiveIssues(projectKey: string) {
   return useBulkRemoval(projectKey, (ids, subtasks) =>
-    api.bulkArchiveIssues(projectKey, ids, subtasks),
+    bulkArchiveIssues(projectKey, ids, subtasks),
   );
 }
 
 export function useBulkDeleteIssues(projectKey: string) {
-  return useBulkRemoval(projectKey, (ids, subtasks) =>
-    api.bulkDeleteIssues(projectKey, ids, subtasks),
-  );
+  return useBulkRemoval(projectKey, (ids, subtasks) => bulkDeleteIssues(projectKey, ids, subtasks));
 }
 
 export function useCreateIssue() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ projectKey, input }: { projectKey: string; input: NewIssueInput }) =>
-      api.createIssue(projectKey, input),
+      createIssue(projectKey, input),
     onSuccess: (_data, { projectKey }) => {
       void qc.invalidateQueries({ queryKey: qk.boardIssues(projectKey) });
       invalidateGroupings(qc);

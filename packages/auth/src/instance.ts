@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { db, appSecret, projectInvite, getSetting, setSetting } from '@repo/db';
+import { db, appSecret, teamInvite, getSetting, setSetting } from '@repo/db';
 import { and, eq, sql } from 'drizzle-orm';
 import { encryptSecret, decryptSecret } from '@repo/crypto';
 import {
@@ -45,6 +45,12 @@ export interface AuthSettings {
   // passkeys, which are added to an account that already exists) as the way in, so
   // the api refuses to turn it off while no OAuth provider is configured.
   emailPassword: boolean;
+  // Sign a person in through an OAuth provider into the existing account with the
+  // same address, whatever the provider says about that address and whether or not
+  // it was ever confirmed here. Off by default: an account nobody confirmed may have
+  // been registered with a password by someone other than the owner of the address,
+  // and trusting the provider hands it to whoever the provider says owns it.
+  trustProviderEmails: boolean;
 }
 
 function defaultAuthSettings(): AuthSettings {
@@ -53,6 +59,7 @@ function defaultAuthSettings(): AuthSettings {
     requireEmailVerification: false,
     magicLink: false,
     emailPassword: true,
+    trustProviderEmails: false,
   };
 }
 
@@ -222,9 +229,14 @@ export async function getProjectEmailConfig(): Promise<InstanceEmailConfig | nul
   return hasEmailProvider(config) ? config : null;
 }
 
-export async function setEmailSettings(patch: InstanceEmailPatch): Promise<InstanceEmailDto> {
+// Resolve a prospective configuration without persisting it. The email test route uses
+// this so an owner can validate edited values first, while omitted secrets still reuse
+// the encrypted value already on the instance.
+export async function resolveEmailConfig(
+  patch: InstanceEmailPatch = {},
+): Promise<InstanceEmailConfig> {
   const current = (await getEmailConfig()) ?? defaultEmailConfig();
-  const next: InstanceEmailConfig = {
+  return {
     smtp: patch.smtp
       ? { ...patch.smtp, password: mergeSecret(current.smtp.password, patch.smtp.password) }
       : current.smtp,
@@ -237,6 +249,10 @@ export async function setEmailSettings(patch: InstanceEmailPatch): Promise<Insta
     from: patch.from ?? current.from,
     allowProjects: patch.allowProjects ?? current.allowProjects,
   };
+}
+
+export async function setEmailSettings(patch: InstanceEmailPatch): Promise<InstanceEmailDto> {
+  const next = await resolveEmailConfig(patch);
   const redacted = toEmailDto(next);
   await writeSecret(EMAIL_SECRET_KEY, next, redacted);
   return redacted;
@@ -505,10 +521,10 @@ export async function verifyScimToken(candidate: string): Promise<boolean> {
 
 // ── Invites ───────────────────────────────────────────────────────────────────
 
-// True when this address has a pending project invite. That is what "invite only"
-// means on this instance: an owner invites someone to a project, and that invite is
-// what lets them register at all. Invites are created and revoked inside a project
-// (project_invite), so there is nothing instance-level to manage.
+// True when this address has a pending invite. That is what "invite only" means on
+// this instance: someone invites them to a team or to one of its projects, and that
+// invite is what lets them register at all. Invites are created and revoked inside a
+// team (team_invite), so there is nothing instance-level to manage.
 //
 // The invite itself is accepted after sign-up, on the /invite/:token screen — this
 // only decides whether the account may be created, and leaves the invite pending.
@@ -516,9 +532,9 @@ export async function hasPendingInvite(email: string): Promise<boolean> {
   const address = email.trim().toLowerCase();
   if (!address) return false;
   const rows = await db
-    .select({ id: projectInvite.id })
-    .from(projectInvite)
-    .where(and(eq(projectInvite.email, address), eq(projectInvite.status, 'pending')))
+    .select({ id: teamInvite.id })
+    .from(teamInvite)
+    .where(and(eq(teamInvite.email, address), eq(teamInvite.status, 'pending')))
     .limit(1);
   return rows.length > 0;
 }

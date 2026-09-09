@@ -1,7 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { mcpTool } from '#mcp/generate';
 import { noContent } from '#shared/http';
-import { guards, entityGuard, assertMcpAllowed } from '#shared/guards';
+import { guards, entityGuard, assertMcpAllowed, requiresPermission } from '#shared/guards';
 import { authContext } from '#shared/auth-context';
 import { assertPermission, assertProjectOwner, requireUser } from '#shared/access';
 import { HttpError } from '#shared/lib';
@@ -32,6 +32,11 @@ import {
   listFeedRange,
   listGroupedFeed,
   createComment,
+  getCommentRef,
+  updateComment,
+  deleteComment,
+  recordActivity,
+  textSide,
   type FeedCursor,
 } from './activity';
 import { listStatusTimeline } from './status-history';
@@ -45,7 +50,7 @@ import {
   type SubtaskDisposition,
   type SubtaskMode,
 } from './subtasks';
-import { listIssueWatchers, setIssueWatching } from './watchers';
+import { isEligibleIssueWatcher, listIssueWatchers, setIssueWatching } from './watchers';
 import {
   createWorklog,
   deleteWorklog,
@@ -54,6 +59,15 @@ import {
   updateWorklog,
 } from './worklogs';
 import { listIssueCycles } from './cycle-history';
+import {
+  createAndLinkPullRequest,
+  linkExistingPullRequest,
+  listLinkablePullRequests,
+  listIssueDevelopmentLinks,
+  removeIssueDevelopmentLink,
+} from '#modules/git/development';
+import { listDevelopmentRepositories, listManagedBranches } from '#modules/git/connections-service';
+import { DevelopmentLinkResponse } from '#modules/git/model';
 import {
   createChecklist,
   createChecklistItem,
@@ -70,9 +84,18 @@ import {
 
 import {
   issueParams,
+  issueDevelopmentLinkParams,
+  issueDevelopmentRepositoryParams,
+  issueDevelopmentListQuery,
+  linkIssueDevelopmentBody,
+  createIssuePullRequestBody,
+  DevelopmentRepositoryResponse,
+  LinkablePullRequestPageResponse,
+  DevelopmentBranchPageResponse,
   IssueResponse,
   IssueLinkResponse,
   IssueWatcherResponse,
+  issueWatcherParams,
   ChecklistItemResponse,
   ChecklistResponse,
   OrderedIdsSchema,
@@ -110,6 +133,8 @@ import {
   updateChecklistItemBody,
   feedRangeQuery,
   createCommentBody,
+  updateCommentBody,
+  commentParams,
   archiveIssueBody,
   BulkUpdatedResponse,
   BulkArchivedResponse,
@@ -158,21 +183,48 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
   .use(guards)
   // Guards for routes that address an entity by its own id (no :projectKey in the
   // path). Set `workItem` / `checklist` / `checklistItem` to the action in the
-  // route options, `worklog` to true. A checklist, its items and a time entry
-  // belong to the issue that carries them, so they all resolve to the same
-  // work_items permission.
+  // route options, `worklog` / `comment` to true. A checklist, its items, a time
+  // entry and a comment belong to the issue that carries them, so they all resolve
+  // to the same work_items permission.
   .macro({
     workItem: entityGuard('work_items', 'Issue not found', (p) =>
       getIssueProjectId(Number(p.issueId)),
     ),
-    checklist: entityGuard('work_items', 'Checklist not found', async (p) => {
-      const issueId = await getChecklistIssueId(Number(p.checklistId));
-      return issueId == null ? null : getIssueProjectId(issueId);
-    }),
-    checklistItem: entityGuard('work_items', 'Checklist item not found', async (p) => {
-      const issueId = await getChecklistItemIssueId(Number(p.itemId));
-      return issueId == null ? null : getIssueProjectId(issueId);
-    }),
+    // The checklist and stats routes carry the section they belong to, so turning it
+    // off in the project's settings closes them.
+    issueChecklist: entityGuard(
+      'work_items',
+      'Issue not found',
+      (p) => getIssueProjectId(Number(p.issueId)),
+      'checklists',
+    ),
+    issueStats: entityGuard(
+      'work_items',
+      'Issue not found',
+      (p) => getIssueProjectId(Number(p.issueId)),
+      'issueStats',
+    ),
+    developmentIntegration: entityGuard('integrations', 'Issue not found', (p) =>
+      getIssueProjectId(Number(p.issueId)),
+    ),
+    checklist: entityGuard(
+      'work_items',
+      'Checklist not found',
+      async (p) => {
+        const issueId = await getChecklistIssueId(Number(p.checklistId));
+        return issueId == null ? null : getIssueProjectId(issueId);
+      },
+      'checklists',
+    ),
+    checklistItem: entityGuard(
+      'work_items',
+      'Checklist item not found',
+      async (p) => {
+        const issueId = await getChecklistItemIssueId(Number(p.itemId));
+        return issueId == null ? null : getIssueProjectId(issueId);
+      },
+      'checklists',
+    ),
     // A time entry belongs to the member who logged it: they change and delete
     // their own with the work_items edit this asserts. Someone else's is a record
     // of what that member did, so only a project owner may touch it — no
@@ -185,6 +237,22 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
           if (!entry) throw new HttpError(404, 'Time entry not found');
           await assertPermission(entry.projectId, user, 'work_items', 'edit');
           if (entry.userId !== requireUser(user).id)
+            await assertProjectOwner(entry.projectId, user);
+          await assertMcpAllowed(entry.projectId, request.headers);
+          return { projectId: entry.projectId };
+        },
+      };
+    },
+    // A comment belongs to the member who wrote it, the same rule the time entry
+    // above carries: the author changes or deletes their own with the work_items
+    // edit this asserts; another member's only a project owner can touch.
+    comment(_enabled: boolean) {
+      return {
+        async resolve({ params, user, request }) {
+          const entry = await getCommentRef(Number((params as { commentId: string }).commentId));
+          if (!entry) throw new HttpError(404, 'Comment not found');
+          await assertPermission(entry.projectId, user, 'work_items', 'edit');
+          if (entry.actorUserId !== requireUser(user).id)
             await assertProjectOwner(entry.projectId, user);
           await assertMcpAllowed(entry.projectId, request.headers);
           return { projectId: entry.projectId };
@@ -418,7 +486,8 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       const parent = await getParentRef(issue.parentId);
       const subtasks = await listSubtasks(issue.id);
       const checklists = await listChecklists(issue.id);
-      return { ...issue, fields, links, watchers, parent, subtasks, checklists };
+      const development = await listIssueDevelopmentLinks(issue.id);
+      return { ...issue, fields, links, watchers, parent, subtasks, checklists, development };
     },
     {
       params: issueSequenceParams,
@@ -451,7 +520,8 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       const parent = await getParentRef(issue.parentId);
       const subtasks = await listSubtasks(issue.id);
       const checklists = await listChecklists(issue.id);
-      return { ...issue, fields, links, watchers, parent, subtasks, checklists };
+      const development = await listIssueDevelopmentLinks(issue.id);
+      return { ...issue, fields, links, watchers, parent, subtasks, checklists, development };
     },
     {
       params: issueParams,
@@ -459,6 +529,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       detail: {
         summary: 'Get an issue',
         description: 'Get an issue by its numeric id.',
+        ...requiresPermission(['work_items', 'read']),
         ...mcpTool('get_issue'),
       },
     },
@@ -491,6 +562,158 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
           'Update an issue by its numeric id. Moving it into a column that is at a ' +
           'hard WIP limit fails with 409 (code wip_limit_exceeded).',
         ...mcpTool('update_issue'),
+      },
+    },
+  )
+
+  .get(
+    '/issues/:issueId/development/repositories',
+    async ({ projectId }) => listDevelopmentRepositories(projectId),
+    {
+      params: issueParams,
+      developmentIntegration: 'edit',
+      response: { 200: t.Array(DevelopmentRepositoryResponse), ...accessErrors },
+      detail: {
+        summary: 'List repositories available to an issue',
+        description:
+          'List connected GitHub and GitLab repositories that can link development work.',
+      },
+    },
+  )
+
+  .get(
+    '/issues/:issueId/development/repositories/:repositoryId/pull-requests',
+    async ({ params, query, projectId }) =>
+      listLinkablePullRequests(
+        projectId,
+        params.issueId,
+        params.repositoryId,
+        query.state ?? 'open',
+        query.page ?? 1,
+      ),
+    {
+      params: issueDevelopmentRepositoryParams,
+      query: issueDevelopmentListQuery,
+      developmentIntegration: 'edit',
+      response: { 200: LinkablePullRequestPageResponse, ...commonErrors },
+      detail: {
+        summary: 'List pull requests available to an issue',
+        description: 'List current pull requests or merge requests from a connected repository.',
+      },
+    },
+  )
+
+  .get(
+    '/issues/:issueId/development/repositories/:repositoryId/branches',
+    async ({ params, query, projectId }) =>
+      listManagedBranches(projectId, params.repositoryId, query.page ?? 1),
+    {
+      params: issueDevelopmentRepositoryParams,
+      query: issueDevelopmentListQuery,
+      developmentIntegration: 'edit',
+      response: { 200: DevelopmentBranchPageResponse, ...commonErrors },
+      detail: {
+        summary: 'List repository branches available to an issue',
+        description: 'List source and target branches for creating a pull request.',
+      },
+    },
+  )
+
+  .post(
+    '/issues/:issueId/development',
+    async ({ params, body, projectId, user, set }) => {
+      const result = await linkExistingPullRequest(
+        projectId,
+        params.issueId,
+        body.repositoryId,
+        body.number,
+      );
+      if (result.created) {
+        if (result.link.number == null)
+          throw new HttpError(500, 'Linked pull request has no number');
+        await recordActivity(
+          params.issueId,
+          [
+            {
+              action: 'git_pr',
+              subject: textSide(result.link.state === 'merged' ? 'merged' : 'opened'),
+              from: {
+                value: `${result.link.repository}#${result.link.number}`,
+                repo: result.link.repository,
+                number: result.link.number,
+              },
+              to: textSide(result.link.url),
+            },
+          ],
+          requireUser(user).id,
+        );
+      }
+      set.status = result.created ? 201 : 200;
+      return result.link;
+    },
+    {
+      params: issueParams,
+      body: linkIssueDevelopmentBody,
+      developmentIntegration: 'edit',
+      response: {
+        200: DevelopmentLinkResponse,
+        201: DevelopmentLinkResponse,
+        ...commonErrors,
+      },
+      detail: {
+        summary: 'Link an existing pull request',
+        description: 'Link a current pull request or merge request from a connected repository.',
+      },
+    },
+  )
+
+  .post(
+    '/issues/:issueId/development/pull-requests',
+    async ({ params, body, projectId, set }) => {
+      const sourceBranch = body.sourceBranch.trim();
+      const targetBranch = body.targetBranch.trim();
+      const title = body.title.trim();
+      if (!sourceBranch || !targetBranch || !title)
+        throw new HttpError(400, 'Branches and title are required');
+      if (sourceBranch === targetBranch)
+        throw new HttpError(400, 'Source and target branches must be different');
+      const result = await createAndLinkPullRequest(projectId, params.issueId, body.repositoryId, {
+        sourceBranch,
+        targetBranch,
+        title,
+        description: body.description,
+        draft: body.draft,
+      });
+      set.status = 201;
+      return result.link;
+    },
+    {
+      params: issueParams,
+      body: createIssuePullRequestBody,
+      developmentIntegration: 'edit',
+      response: { 201: DevelopmentLinkResponse, ...commonErrors, ...errors(409) },
+      detail: {
+        summary: 'Create a pull request for an issue',
+        description:
+          'Create a GitHub pull request or GitLab merge request from an existing branch.',
+      },
+    },
+  )
+
+  .delete(
+    '/issues/:issueId/development/:linkId',
+    async ({ params }) => {
+      if (!(await removeIssueDevelopmentLink(params.issueId, params.linkId)))
+        throw new HttpError(404, 'Development link not found');
+      return noContent();
+    },
+    {
+      params: issueDevelopmentLinkParams,
+      workItem: 'edit',
+      response: { 204: t.Void(), ...commonErrors },
+      detail: {
+        summary: 'Unlink a development item',
+        description: 'Remove one branch, pull request, or merge request from an issue.',
       },
     },
   )
@@ -666,7 +889,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
   // after a checklist write rather than the first render.
   .get('/issues/:issueId/checklists', async ({ params }) => listChecklists(params.issueId), {
     params: issueParams,
-    workItem: 'read',
+    issueChecklist: 'read',
     response: { 200: t.Array(ChecklistResponse), ...commonErrors },
     detail: {
       summary: "List an issue's checklists",
@@ -683,7 +906,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
     {
       body: checklistTitleBody,
       params: issueParams,
-      workItem: 'edit',
+      issueChecklist: 'edit',
       response: { 201: ChecklistResponse, ...commonErrors },
       detail: {
         summary: 'Add a checklist',
@@ -701,7 +924,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
     {
       body: OrderedIdsSchema,
       params: issueParams,
-      workItem: 'edit',
+      issueChecklist: 'edit',
       response: { 200: t.Array(ChecklistResponse), ...commonErrors },
       detail: {
         summary: "Reorder an issue's checklists",
@@ -859,7 +1082,9 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       detail: {
         summary: 'Change a time entry',
         description:
-          "Change the time, the day or the note of an entry. Another member's entry needs work_items delete.",
+          'Change the time, the day or the note of an entry. Your own entry needs work_items ' +
+          "edit; another member's entry is a record of what they did, so only a project owner " +
+          'can change it.',
         ...mcpTool('update_worklog'),
       },
     },
@@ -879,16 +1104,19 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       detail: {
         summary: 'Delete a time entry',
         description:
-          "Remove one entry, lowering the issue's logged time by it. Another member's entry needs work_items delete.",
+          "Remove one entry, lowering the issue's logged time by it. Your own entry needs " +
+          "work_items edit; another member's entry is a record of what they did, so only a " +
+          'project owner can remove it.',
         ...mcpTool('delete_worklog'),
       },
     },
   )
 
   // Follows the issue: the caller receives every notification it produces until
-  // they unwatch it. Only ever the caller — one member does not subscribe
-  // another. Reading the issue is enough, since watching adds no other access.
-  // Both routes return the resulting list, which the issue read also carries.
+  // they unwatch it. This self-service route only ever changes the caller; editors
+  // use the watcher-management routes below for other members. Reading the issue
+  // is enough, since watching adds no other access. Both routes return the same
+  // watcher list carried by the issue read.
   .post(
     '/issues/:issueId/watch',
     async ({ params, projectId, user }) => {
@@ -922,6 +1150,53 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       detail: {
         summary: 'Unwatch an issue',
         description: 'Unsubscribe the current user from an issue and return its watchers.',
+      },
+    },
+  )
+
+  // Editors can curate the full watcher list when a handoff or review needs to
+  // reach someone immediately. The target must be a real project member: agents
+  // have their own delegation flow and must never receive human notifications.
+  .put(
+    '/issues/:issueId/watchers/:userId',
+    async ({ params, projectId }) => {
+      if (!(await isEligibleIssueWatcher(projectId, params.userId))) {
+        throw new HttpError(400, 'Watcher must be a human project member with work item access');
+      }
+      await setIssueWatching(params.issueId, params.userId, true);
+      return listIssueWatchers(projectId, params.issueId);
+    },
+    {
+      params: issueWatcherParams,
+      workItem: 'edit',
+      response: { 200: t.Array(IssueWatcherResponse), ...commonErrors },
+      detail: {
+        summary: 'Add an issue watcher',
+        description:
+          'Subscribe another real project member to the issue. Requires permission to edit work items.',
+        ...mcpTool('add_issue_watcher'),
+      },
+    },
+  )
+
+  .delete(
+    '/issues/:issueId/watchers/:userId',
+    async ({ params, projectId }) => {
+      if (!(await isEligibleIssueWatcher(projectId, params.userId))) {
+        throw new HttpError(400, 'Watcher must be a human project member with work item access');
+      }
+      await setIssueWatching(params.issueId, params.userId, false);
+      return listIssueWatchers(projectId, params.issueId);
+    },
+    {
+      params: issueWatcherParams,
+      workItem: 'edit',
+      response: { 200: t.Array(IssueWatcherResponse), ...commonErrors },
+      detail: {
+        summary: 'Remove an issue watcher',
+        description:
+          'Unsubscribe another real project member from the issue. Requires permission to edit work items.',
+        ...mcpTool('remove_issue_watcher'),
       },
     },
   )
@@ -976,7 +1251,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
   // stretch.
   .get('/issues/:issueId/timeline', async ({ params }) => listStatusTimeline(params.issueId), {
     params: issueParams,
-    workItem: 'read',
+    issueStats: 'read',
     response: { 200: t.Array(TimelineSegmentResponse), ...commonErrors },
     detail: {
       summary: 'Get an issue status timeline',
@@ -992,7 +1267,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
     {
       params: issueParams,
       query: feedRangeQuery,
-      workItem: 'read',
+      issueStats: 'read',
       response: { 200: t.Array(FeedItemResponse), ...commonErrors },
       detail: {
         summary: 'Get the activity of one timeline stretch',
@@ -1030,7 +1305,7 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
     {
       body: createCommentBody,
       params: issueParams,
-      workItem: 'create',
+      workItem: 'edit',
       response: { 201: FeedItemResponse, ...commonErrors },
       detail: {
         summary: 'Add a comment',
@@ -1040,6 +1315,50 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
           '@username in the body notifies that member or AI agent; the handles are ' +
           'the usernames in get_project.assignees.',
         ...mcpTool('add_comment'),
+      },
+    },
+  )
+
+  // Edits a comment's body. The author edits their own with the work_items edit
+  // the comment guard asserts; another member's only a project owner can change.
+  .patch(
+    '/comments/:commentId',
+    async ({ params, body, user, projectId }) =>
+      updateComment(params.commentId, body.body, requireUser(user).id, projectId),
+    {
+      body: updateCommentBody,
+      params: commentParams,
+      comment: true,
+      response: { 200: FeedItemResponse, ...commonErrors },
+      detail: {
+        summary: 'Edit a comment',
+        description:
+          'Change the text of a comment, and re-resolve its mentions: the members an ' +
+          'edit newly names are notified, the agents run. Your own comment needs ' +
+          "work_items edit; another member's comment only a project owner can change.",
+        ...mcpTool('update_comment'),
+      },
+    },
+  )
+
+  // Deletes a comment, together with its replies (they cascade on reply_to_id).
+  .delete(
+    '/comments/:commentId',
+    async ({ params, user, projectId }) => {
+      const removed = await deleteComment(params.commentId, requireUser(user).id, projectId);
+      if (!removed) throw new HttpError(404, 'Comment not found');
+      return noContent();
+    },
+    {
+      params: commentParams,
+      comment: true,
+      response: { 204: t.Void(), ...commonErrors },
+      detail: {
+        summary: 'Delete a comment',
+        description:
+          'Remove a comment and its replies. Your own comment needs work_items edit; ' +
+          "another member's comment only a project owner can remove.",
+        ...mcpTool('delete_comment'),
       },
     },
   );

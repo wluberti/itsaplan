@@ -1,12 +1,12 @@
 import { randomInt } from 'node:crypto';
-import { db } from '@repo/db';
+import { db, defaultMemberPermissions } from '@repo/db';
 import { eq, sql, type SQL } from 'drizzle-orm';
 import { betterAuth } from 'better-auth';
 import { createAuthMiddleware, APIError } from 'better-auth/api';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { passkey } from '@better-auth/passkey';
 import { apiKey } from '@better-auth/api-key';
-import { openAPI, magicLink, username, genericOAuth } from 'better-auth/plugins';
+import { mcp, openAPI, magicLink, username, genericOAuth } from 'better-auth/plugins';
 import type { GenericOAuthConfig } from 'better-auth/plugins/generic-oauth';
 import * as schema from '@repo/db/schema';
 import {
@@ -138,6 +138,22 @@ async function refreshOidcOptions(): Promise<boolean> {
   }
 }
 
+// The two conditions better-auth checks before linking an address to an account that
+// already has it are read from different places: `trustedProviders` per request,
+// through the resolver below, and `requireLocalEmailVerified` off the options object
+// at the moment of the decision. The resolver runs first, in the same request, and
+// leaves the setting here for the getter to read.
+let trustProviderEmails = false;
+
+// The trusted providers for one request. The settings are read on the OAuth callback
+// only — the resolver runs on every request to the auth API, and a session check has
+// no linking decision to make.
+async function resolveTrustedProviders(request?: Request): Promise<string[]> {
+  if (!request || !new URL(request.url).pathname.includes('/callback/')) return [];
+  trustProviderEmails = (await getAuthSettings()).trustProviderEmails;
+  return trustProviderEmails ? ['google', OIDC_PROVIDER_ID] : [];
+}
+
 // The endpoints of the email/password form, including the two the magic link uses.
 // Turning password authentication off refuses all of them, so a link issued before
 // the switch was flipped cannot still be redeemed. Passkey sign-in is not here: a
@@ -249,6 +265,9 @@ export const auth = betterAuth({
       verification: schema.verification,
       passkey: schema.passkey,
       apikey: schema.apikey,
+      oauthApplication: schema.oauthApplication,
+      oauthAccessToken: schema.oauthAccessToken,
+      oauthConsent: schema.oauthConsent,
     },
   }),
 
@@ -289,16 +308,26 @@ export const auth = betterAuth({
   // Google sign-in. The provider is always mounted; whether it may run is decided per
   // request in the hook below, the same way the magic link is handled. The factory
   // runs once, at startup, and returns the shared options object described above.
-  //
-  // Account linking is left at better-auth's defaults: a Google address that already
-  // has an account signs into it and gains a linked google account row, but only when
-  // that account's email is confirmed (accountLinking.requireLocalEmailVerified
-  // defaults to true). Google itself always reports a verified address, and after a
-  // successful link better-auth marks the local user confirmed too.
   socialProviders: {
     google: async () => {
       await refreshGoogleOptions();
       return googleOptions;
+    },
+  },
+
+  // A provider address that already has an account signs into it and gains a linked
+  // account row, rather than being refused as a duplicate. By default that happens
+  // only when the provider reported the address as verified and the local account
+  // confirmed its own — Google always reports a verified address, an OIDC provider
+  // need not, and an instance with no mail provider has no confirmed accounts at
+  // all. The instance setting drops both conditions; after a successful link
+  // better-auth marks the local user confirmed too.
+  account: {
+    accountLinking: {
+      trustedProviders: resolveTrustedProviders,
+      get requireLocalEmailVerified() {
+        return !trustProviderEmails;
+      },
     },
   },
 
@@ -445,6 +474,28 @@ export const auth = betterAuth({
             },
           };
         },
+        // A project belongs to a team, so an account owns one from the moment it is
+        // created, named after the username the hook above settled on. The team is
+        // also where the roles its projects assign live, so it starts with the
+        // default one.
+        after: async (created) => {
+          const handle = typeof created.username === 'string' ? created.username : created.name;
+          await db.transaction(async (tx) => {
+            const [row] = await tx
+              .insert(schema.team)
+              .values({ name: handle })
+              .returning({ id: schema.team.id });
+            await tx
+              .insert(schema.teamMember)
+              .values({ teamId: row.id, userId: created.id, role: 'owner' });
+            await tx.insert(schema.teamRole).values({
+              teamId: row.id,
+              name: 'Member',
+              isDefault: true,
+              permissions: defaultMemberPermissions(),
+            });
+          });
+        },
       },
     },
     session: {
@@ -531,6 +582,18 @@ export const auth = betterAuth({
       minUsernameLength: USERNAME_MIN_LENGTH,
       maxUsernameLength: USERNAME_MAX_LENGTH,
     }),
+    // Native OAuth 2.1 provider for Streamable HTTP MCP clients. It uses the
+    // existing Better Auth session, requires PKCE, and supports dynamic public
+    // clients such as ChatGPT without exposing a personal API key.
+    mcp({
+      loginPage: `${trustedOrigins[0]}/login`,
+      resource: `${baseURL}/mcp`,
+      oidcConfig: {
+        loginPage: `${trustedOrigins[0]}/login`,
+        requirePKCE: true,
+        consentPage: `${trustedOrigins[0]}/oauth/consent`,
+      },
+    }),
     // OpenAPI reference for the better-auth handler. Serves a Scalar UI at
     // /api/auth/reference and the raw schema at /api/auth/open-api/generate-schema.
     // The schema is built from every active plugin, so the passkey and apiKey
@@ -586,6 +649,7 @@ export {
   getEmailSettings,
   setEmailSettings,
   getEmailConfig,
+  resolveEmailConfig,
   getProjectEmailConfig,
   hasConfiguredEmailProvider,
   getGoogleSettings,
@@ -617,3 +681,9 @@ export type {
   InstanceOidcConfig,
   InstanceScimDto,
 } from './instance';
+
+export {
+  withMcpAuth,
+  oAuthDiscoveryMetadata,
+  oAuthProtectedResourceMetadata,
+} from 'better-auth/plugins';

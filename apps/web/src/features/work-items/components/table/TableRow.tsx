@@ -1,6 +1,7 @@
 import { useCallback } from 'react';
 import { useDndContext, useDraggable, useDroppable } from '@dnd-kit/core';
-import { type ProjectDetail, type BoardIssue } from '@/lib/api';
+import type { ProjectDetail } from '@/lib/api/endpoints/projects';
+import type { BoardIssue } from '@/lib/api/endpoints/issues';
 import { type Maps } from '@/utils/project';
 import { useIsPhone } from '@/hooks/useIsPhone';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -83,7 +84,10 @@ export function TableRow({
         ref={mergedRef}
         {...attributes}
         {...listeners}
-        onClick={onClick}
+        onClick={(e) => {
+          e.preventDefault();
+          onClick();
+        }}
         className={cn(
           'relative grid cursor-grab gap-3 border-b py-2 pr-4 text-sm transition-colors sm:touch-none',
           isBlocked(issue) ? 'row-blocked' : 'hover:bg-accent/40',

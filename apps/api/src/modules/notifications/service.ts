@@ -106,6 +106,32 @@ export async function notifyComment(
   await insertNotifications(rows);
 }
 
+// Fan out the mentions an edit newly added to a comment. The handles the comment
+// already named are filtered out by the caller, so an edit never re-pings them, and
+// the watchers hear nothing (unlike a new comment, which would send 'commented').
+// Being mentioned subscribes to the issue, the same as in a new comment.
+export async function notifyEditedCommentMentions(
+  projectId: number,
+  comment: { issueId: number; id: number; actorUserId: string | null },
+  mentionedUsers: MentionedUsers,
+): Promise<void> {
+  const mentioned = [...mentionedUsers.memberIds, ...mentionedUsers.agentUserIds].filter(
+    (userId) => userId !== comment.actorUserId,
+  );
+  if (mentioned.length === 0) return;
+  await autoWatchIssue(projectId, comment.issueId, mentioned);
+  await insertNotifications(
+    mentioned.map((userId) => ({
+      userId,
+      projectId,
+      issueId: comment.issueId,
+      sourceActivityId: comment.id,
+      type: 'mentioned' as const,
+      actorUserId: comment.actorUserId,
+    })),
+  );
+}
+
 // Fan out the mentions an issue's description or markdown custom field gained. Only
 // the handles the write added are reached, so re-saving a text keeps quiet about the
 // people it already named. Being mentioned subscribes to the issue, the same as it
@@ -275,9 +301,11 @@ function mapRow(r: {
 }
 
 // One page of a user's inbox, newest first, keyset-paged on (created_at, id).
-// includeRead defaults to true (the inbox shows read notifications too); a snoozed
-// notification (snoozed_until still in the future) is hidden unless includeSnoozed.
-// limit is clamped to 1..100.
+// Only projects the user is still a member of: the row carries the issue title, its
+// current state and the project name read at query time, so a removed member must
+// not reach them. includeRead defaults to true (the inbox shows read notifications
+// too); a snoozed notification (snoozed_until still in the future) is hidden unless
+// includeSnoozed. limit is clamped to 1..100.
 export async function listNotifications(
   userId: string,
   opts: { before?: NotificationCursor | null; limit?: number; filters?: NotificationFilters } = {},
@@ -317,6 +345,10 @@ export async function listNotifications(
       payload: issueActivity.payload,
     })
     .from(notification)
+    .innerJoin(
+      projectMember,
+      and(eq(projectMember.projectId, notification.projectId), eq(projectMember.userId, userId)),
+    )
     .innerJoin(issue, eq(issue.id, notification.issueId))
     .innerJoin(project, eq(project.id, notification.projectId))
     .innerJoin(projectColumn, eq(projectColumn.id, issue.columnId))
@@ -335,7 +367,7 @@ export async function listNotifications(
 }
 
 // The number of unread, non-snoozed notifications for the inbox badge, optionally
-// scoped to one project.
+// scoped to one project. Counts only what listNotifications shows.
 export async function unreadCount(userId: string, projectId?: number): Promise<number> {
   const conds = [
     eq(notification.userId, userId),
@@ -346,6 +378,10 @@ export async function unreadCount(userId: string, projectId?: number): Promise<n
   const [row] = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(notification)
+    .innerJoin(
+      projectMember,
+      and(eq(projectMember.projectId, notification.projectId), eq(projectMember.userId, userId)),
+    )
     .where(and(...conds));
   return row?.n ?? 0;
 }

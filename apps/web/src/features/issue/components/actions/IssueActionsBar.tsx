@@ -1,13 +1,20 @@
 import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { Archive, ArchiveRestore, Check, ClipboardCopy, Globe, Share2, Trash2 } from 'lucide-react';
 import {
-  api,
-  type ActionDef,
-  type ProjectDetail,
-  type IssueDetail as IssueDetailRow,
-} from '@/lib/api';
+  Archive,
+  ArchiveRestore,
+  Check,
+  ClipboardCopy,
+  GitBranch,
+  Globe,
+  Share2,
+  Trash2,
+} from 'lucide-react';
+import type { ActionDef } from '@/lib/api/endpoints/actions';
+import type { ProjectDetail } from '@/lib/api/endpoints/projects';
+import type { IssueDetail as IssueDetailRow } from '@/lib/api/endpoints/issues';
+import { enableIssueShare, disableIssueShare } from '@/lib/api/endpoints/share';
 import { actionIcon } from '@/utils/actionIcons';
 import { useActionsQuery } from '@/services/actions.service';
 import { useRestoreIssue } from '@/services/issues.service';
@@ -15,7 +22,7 @@ import { qk } from '@/services/queryKeys';
 import { usePermissions } from '@/hooks/usePermissions';
 import { useArchiveAction } from '../../hooks/useArchiveAction';
 import { ApplyActionDialog, DeleteIssueDialog, matchedActions } from './IssueActions';
-import { buildIssuePrompt } from '../../utils/issuePrompt';
+import { buildIssueBranchName, buildIssuePrompt } from '../../utils/issuePrompt';
 import { useSession } from '@/lib/auth-client';
 import { shareIssuePath } from '@/utils/paths';
 import { Button } from '@/components/ui/button';
@@ -59,12 +66,12 @@ export default function IssueActionsBar({
   // shareExtended (which the dialog reads) stay in sync. The same call creates the
   // link and flips how much a live one exposes.
   async function share(extended: boolean) {
-    const { token } = await api.enableIssueShare(issue.id, extended);
+    const { token } = await enableIssueShare(issue.id, extended);
     await qc.invalidateQueries({ queryKey: qk.issue(issue.id) });
     return token;
   }
   async function disableShare() {
-    await api.disableIssueShare(issue.id);
+    await disableIssueShare(issue.id);
     await qc.invalidateQueries({ queryKey: qk.issue(issue.id) });
   }
 
@@ -86,6 +93,11 @@ export default function IssueActionsBar({
     toast.success(t('shortLinkCopied'));
   }
 
+  async function copyBranch() {
+    await navigator.clipboard.writeText(buildIssueBranchName(issue, session?.user));
+    toast.success(t('branchCopied'));
+  }
+
   // In the panel header the action buttons sit next to the size-7 expand/close
   // buttons, so they match that size; the row uses the roomier size.
   const btnSize = variant === 'header' ? 'icon-xs' : 'icon-sm';
@@ -104,6 +116,19 @@ export default function IssueActionsBar({
           </Button>
         </TooltipTrigger>
         <TooltipContent>{t('copyShortLink')}</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size={btnSize}
+            className="text-muted-foreground hover:text-foreground"
+            onClick={copyBranch}
+          >
+            <GitBranch className="size-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t('copyBranch')}</TooltipContent>
       </Tooltip>
       <Tooltip>
         <TooltipTrigger asChild>

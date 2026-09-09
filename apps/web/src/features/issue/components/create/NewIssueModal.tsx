@@ -1,18 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { type Editor } from '@tiptap/react';
 import { MoreHorizontal } from 'lucide-react';
-import {
-  type CycleRef,
-  type Issue,
-  type IssueFieldValueInput,
-  type ProjectDetail,
-} from '@/lib/api';
+import type { IssueTemplate } from '@/lib/api/endpoints/issueTemplates';
+import type { ProjectDetail } from '@/lib/api/endpoints/projects';
+import type { CycleRef, Issue, IssueFieldValueInput } from '@/lib/api/endpoints/issues';
 import { type NewIssueDefaults } from '@/utils/project';
+import { parseDate } from '@/utils/dates';
 import { cn } from '@/lib/utils';
 import { useSession } from '@/lib/auth-client';
 import { useCreateIssue, useSetFieldValue, useUpdateIssue } from '@/services/issues.service';
 import { fieldDefsForType } from '../../utils/fieldDefs';
-import { useFileDragZone } from '../../hooks/useFileDragZone';
+import { useFileDragZone } from '@/hooks/useFileDragZone';
 import { useFilePaste } from '../../hooks/useFilePaste';
 import { useNewIssueAttachments } from '../../hooks/useNewIssueAttachments';
 import {
@@ -21,7 +19,7 @@ import {
   replaceEmbed,
   stripEmbed,
   type Embeddable,
-} from '../../utils/attachmentEmbed';
+} from '@/components/common/editor/attachmentEmbed';
 import { DESCRIPTION_SECTION, OTHER_SECTION, fieldSectionId } from '../../utils/bodySections';
 import { hasFieldValue } from '../../utils/fieldValues';
 import EstimatePill from '../fields/EstimatePill';
@@ -29,7 +27,8 @@ import IssueCustomFieldPill from '../fields/IssueCustomFieldPill';
 import NewIssueAttachButton from './NewIssueAttachButton';
 import NewIssueAttachmentStrip from './NewIssueAttachmentStrip';
 import NewIssueDropOverlay from './NewIssueDropOverlay';
-import Modal from '@/components/common/overlay/Modal';
+import NewIssueTemplatePill from './NewIssueTemplatePill';
+import Modal, { useModalFullscreen } from '@/components/common/overlay/Modal';
 import NewIssueBody from './NewIssueBody';
 import AssigneeSelect from '@/components/common/fields/AssigneeSelect';
 import DatePill from '@/components/common/fields/DatePill';
@@ -106,7 +105,7 @@ export default function NewIssueModal({
   const [labelIds, setLabelIds] = useState<number[]>(defaults.labelIds ?? []);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [fullscreen, setFullscreen] = useState(false);
+  const { fullscreen, onToggleFullscreen } = useModalFullscreen();
 
   // Custom fields for the selected type (project-wide + type-scoped), off the
   // scaffold every member already loads. Fields flagged "show in main info" get their
@@ -124,6 +123,11 @@ export default function NewIssueModal({
     Object.fromEntries((defaults.fieldValues ?? []).map((f) => [f.fieldId, { value: f.userId }])),
   );
   const [justAddedId, setJustAddedId] = useState<number | null>(null);
+  // The template applied last, named on its pill, and how many times one has been
+  // applied. Every apply remounts the body: its editors read their markdown once,
+  // when they are created, so applying the same template twice has to remount too.
+  const [template, setTemplate] = useState<IssueTemplate | null>(null);
+  const [applyCount, setApplyCount] = useState(0);
 
   const createIssue = useCreateIssue();
   const updateIssue = useUpdateIssue(project.project.key);
@@ -199,6 +203,12 @@ export default function NewIssueModal({
     setActiveFieldIds((prev) => prev.filter((id) => valid.has(id)));
   }, [fieldDefs]);
 
+  // The calendars grey out days that would put one date on the wrong side of the
+  // other: the start no later than the due date, the due date no earlier than the
+  // start. Equal dates are allowed.
+  const latestStart = parseDate(dueDate);
+  const earliestDue = parseDate(startDate);
+
   const errorMessage = error ?? attachments.error;
   const bodyDefs = fieldDefs.filter((d) => d.showInBody);
   const propertyDefs = fieldDefs.filter((d) => !d.showInBody);
@@ -211,6 +221,20 @@ export default function NewIssueModal({
 
   function setFieldValue(id: number, patch: IssueFieldValueInput) {
     setFieldValues((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+  }
+
+  // Fills the dialog in from a template. A property the template leaves unset
+  // presets nothing, so what the dialog already holds stays.
+  function applyTemplate(next: IssueTemplate) {
+    setTemplate(next);
+    setApplyCount((n) => n + 1);
+    if (next.titleTemplate) setTitle(next.titleTemplate);
+    setDescription(next.descriptionTemplate);
+    if (next.columnId != null) setColumnId(next.columnId);
+    if (next.typeId != null) setTypeId(next.typeId);
+    if (next.priority != null) setPriority(next.priority);
+    if (next.assigneeUserId != null) setAssigneeUserId(next.assigneeUserId);
+    if (next.labelIds.length > 0) setLabelIds(next.labelIds);
   }
 
   async function submit() {
@@ -299,11 +323,26 @@ export default function NewIssueModal({
     <Modal
       title={t('title')}
       crumb={crumb}
-      projectKey={project.project.key}
+      headerAction={
+        project.issueTemplates.length > 0 && (
+          <NewIssueTemplatePill
+            templates={project.issueTemplates}
+            applied={template}
+            onApply={applyTemplate}
+          />
+        )
+      }
+      scope={project.project.key}
       onClose={onClose}
+      // The template pill comes before the title in the DOM, so the title has to
+      // claim the focus itself.
+      onOpenAutoFocus={(event) => {
+        event.preventDefault();
+        titleRef.current?.focus();
+      }}
       wide
       fullscreen={fullscreen}
-      onToggleFullscreen={() => setFullscreen((v) => !v)}
+      onToggleFullscreen={onToggleFullscreen}
       // Halves the dialog's bottom padding: the footer then sits as far from the
       // separator above it as from the dialog edge below.
       className="pb-3"
@@ -323,10 +362,10 @@ export default function NewIssueModal({
           placeholder={t('titlePlaceholder')}
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          autoFocus
         />
         <div className={cn('flex min-h-0 flex-col overflow-hidden', fullscreen && 'flex-1')}>
           <NewIssueBody
+            key={applyCount}
             section={bodySection}
             onSectionChange={setBodySection}
             fullscreen={fullscreen}
@@ -407,12 +446,14 @@ export default function NewIssueModal({
             value={startDate || null}
             placeholder={tFields('startDate')}
             onChange={(v) => setStartDate(v ?? '')}
+            disabled={latestStart ? { after: latestStart } : undefined}
           />
 
           <DatePill
             value={dueDate || null}
             placeholder={tFields('dueDate')}
             onChange={(v) => setDueDate(v ?? '')}
+            disabled={earliestDue ? { before: earliestDue } : undefined}
           />
 
           {activeDefs.map((def) => (
@@ -471,7 +512,7 @@ export default function NewIssueModal({
             onAnnotate={annotateAttachment}
             onRemove={removeAttachment}
           />
-          <Button className="ml-auto" disabled={saving || !title.trim()} onClick={submit}>
+          <Button className="ms-auto" disabled={saving || !title.trim()} onClick={submit}>
             {t('submit')}
           </Button>
         </div>

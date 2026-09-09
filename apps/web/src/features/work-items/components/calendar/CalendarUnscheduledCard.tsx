@@ -1,5 +1,6 @@
 import { useDraggable } from '@dnd-kit/core';
-import { type ProjectDetail, type Issue } from '@/lib/api';
+import type { ProjectDetail } from '@/lib/api/endpoints/projects';
+import type { Issue } from '@/lib/api/endpoints/issues';
 import { useIsPhone } from '@/hooks/useIsPhone';
 import { usePermissions } from '@/hooks/usePermissions';
 import { cn } from '@/lib/utils';
@@ -31,7 +32,10 @@ export function CalendarUnscheduledCard({
         ref={setNodeRef}
         {...attributes}
         {...listeners}
-        onClick={() => onOpen(issue.id)}
+        onClick={(e) => {
+          e.preventDefault();
+          onOpen(issue.id);
+        }}
         className={cn(
           'kanban-card flex cursor-pointer items-center gap-2 rounded-md p-2 text-xs sm:touch-none',
           isDragging && 'opacity-40',

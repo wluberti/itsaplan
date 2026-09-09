@@ -5,6 +5,7 @@ import {
   getAuthSettings,
   setAuthSettings,
   getEmailSettings,
+  resolveEmailConfig,
   setEmailSettings,
   hasConfiguredEmailProvider,
   getGoogleSettings,
@@ -17,17 +18,24 @@ import {
   setScimSettings,
   rotateScimToken,
 } from '@repo/auth';
+import { emailBody, hasEmailProvider, sendEmail } from '@repo/mailer';
 import { authContext } from '#shared/auth-context';
 import { requireGod } from '#shared/access';
 import { HttpError } from '#shared/lib';
 import { accessErrors, commonErrors, errors } from '#shared/responses';
+import { paginate } from '#shared/pagination';
 import { noContent } from '#shared/http';
 import { deleteProject } from '#modules/projects/service';
 import {
   deleteInstanceUser,
   getInstanceProject,
+  getInstanceTeam,
   getInstanceUser,
   listInstanceProjects,
+  listInstanceProjectOptions,
+  listInstanceTeams,
+  listInstanceTeamProjects,
+  listInstanceTeamMembers,
   listInstanceUsers,
   listScimGroups,
   setScimGroupMappings,
@@ -38,12 +46,18 @@ import {
   AuthSettingsResponse,
   EmailSettingsBody,
   EmailSettingsResponse,
+  EmailTestResponse,
   GoogleSettingsBody,
   GoogleSettingsResponse,
   InstanceProjectDetailResponse,
-  InstanceProjectListResponse,
+  InstanceProjectOptionListResponse,
+  InstanceProjectPageResponse,
+  InstanceTeamMemberPageResponse,
+  InstanceTeamPageResponse,
+  InstanceTeamProjectPageResponse,
+  InstanceTeamResponse,
   InstanceUserDetailResponse,
-  InstanceUserListResponse,
+  InstanceUserPageResponse,
   OidcSettingsBody,
   OidcSettingsResponse,
   ScimGroupMappingsBody,
@@ -55,12 +69,14 @@ import {
   TelegramSettingsBody,
   TelegramSettingsResponse,
   deleteUserQuery,
-  listProjectsQuery,
   listUsersQuery,
   projectParams,
   scimGroupParams,
+  searchPageQuery,
+  teamParams,
   userParams,
 } from './model';
+import { emailTestError } from './email-test';
 import { getInstanceBotSettings, setInstanceBotSettings } from '#modules/telegram/service';
 import { SCIM_BASE_URL } from '#modules/scim/resource';
 import {
@@ -82,8 +98,8 @@ import {
 // God mode: instance-wide administration, open only to the "god" user (the first
 // registered account). It covers how people may register, the mail provider that
 // sends authentication email, the OAuth credentials, and SCIM provisioning. Invites
-// are per project (project_invite), managed in the project's Members section — there
-// is nothing instance-level to add here.
+// are per team (team_invite), managed in the team panel and in the project's Members
+// section — there is nothing instance-level to add here.
 //
 // The settings themselves are owned by @repo/auth, which reads them at sign-up and
 // when sending mail; these routes only expose them over HTTP. Secrets are never
@@ -93,6 +109,16 @@ import {
 // be turned off while one can.
 async function hasSsoProvider(): Promise<boolean> {
   return (await hasConfiguredOidc()) || (await hasConfiguredGoogle());
+}
+
+async function assertUsableSignInMethod(
+  nextProviderUsable: boolean,
+  otherProviderUsable: boolean,
+): Promise<void> {
+  const auth = await getAuthSettings();
+  if (!auth.emailPassword && !nextProviderUsable && !otherProviderUsable) {
+    throw new HttpError(400, 'Enable password sign-in or another single sign-on provider first');
+  }
 }
 
 export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
@@ -164,6 +190,44 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
     },
   })
 
+  .post(
+    '/god/email-settings/test',
+    async ({ user, body: patch }) => {
+      const current = requireGod(user);
+      if (!current.email) throw new HttpError(400, 'The instance owner has no email address');
+      const config = await resolveEmailConfig(patch ?? {});
+      if (!hasEmailProvider(config)) {
+        throw new HttpError(400, 'Configure an email provider first');
+      }
+
+      const body = emailBody(
+        "This test confirms that It's a Plan can send email through the configured provider.",
+      );
+      const result = await sendEmail(
+        { ...config, smtp: { ...config.smtp, timeout: config.smtp.timeout ?? 15 } },
+        {
+          to: current.email,
+          subject: "It's a Plan email test",
+          ...body,
+        },
+      );
+      if (!result.ok) {
+        console.error('[god] test email failed:', result.error);
+        throw new HttpError(502, emailTestError(result.error));
+      }
+      return { recipient: current.email };
+    },
+    {
+      body: t.Optional(EmailSettingsBody),
+      response: { 200: EmailTestResponse, ...commonErrors, ...errors(502) },
+      detail: {
+        summary: 'Send a test email',
+        description:
+          'Send a test message through the supplied provider settings without saving them.',
+      },
+    },
+  )
+
   .get(
     '/god/google-settings',
     async () => ({ ...(await getGoogleSettings()), redirectUri: GOOGLE_REDIRECT_URI }),
@@ -180,13 +244,18 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
     '/god/google-settings',
     async ({ body }) => {
       const current = await getGoogleSettings();
+      const enabled = body.enabled ?? current.enabled;
       const clientId = body.clientId ?? current.clientId;
       const hasClientSecret = (body.clientSecret?.length ?? 0) > 0 || current.hasClientSecret;
       // Turning it on without credentials would only offer a button that fails at
       // Google, so the same rule as the mail-dependent options applies here.
-      if (body.enabled && (clientId.length === 0 || !hasClientSecret)) {
+      if (enabled && (clientId.length === 0 || !hasClientSecret)) {
         throw new HttpError(400, 'Add the Google client ID and secret first');
       }
+      await assertUsableSignInMethod(
+        enabled && clientId.length > 0 && hasClientSecret,
+        await hasConfiguredOidc(),
+      );
       const next = await setGoogleSettings(body);
       return { ...next, redirectUri: GOOGLE_REDIRECT_URI };
     },
@@ -216,17 +285,19 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
     '/god/oidc-settings',
     async ({ body }) => {
       const current = await getOidcSettings();
+      const enabled = body.enabled ?? current.enabled;
       const discoveryUrl = body.discoveryUrl ?? current.discoveryUrl;
       const clientId = body.clientId ?? current.clientId;
       const hasClientSecret = (body.clientSecret?.length ?? 0) > 0 || current.hasClientSecret;
       // Turning it on without credentials would only offer a button that fails at
       // the provider, the same rule the Google settings apply.
-      if (
-        body.enabled &&
-        (discoveryUrl.length === 0 || clientId.length === 0 || !hasClientSecret)
-      ) {
+      if (enabled && (discoveryUrl.length === 0 || clientId.length === 0 || !hasClientSecret)) {
         throw new HttpError(400, 'Add the discovery URL, client ID and secret first');
       }
+      await assertUsableSignInMethod(
+        enabled && discoveryUrl.length > 0 && clientId.length > 0 && hasClientSecret,
+        await hasConfiguredGoogle(),
+      );
       const next = await setOidcSettings(body);
       return { ...next, redirectUri: OIDC_REDIRECT_URI };
     },
@@ -378,7 +449,7 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
     },
   })
 
-  .post('/god/updates/check', () => getUpdateStatus(), {
+  .post('/god/updates/check', () => getUpdateStatus(true), {
     response: { 200: UpdateStatusSchema, ...errors(401, 403) },
     detail: {
       summary: 'Check for updates now',
@@ -427,19 +498,16 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
   .get(
     '/god/users',
     ({ query }) =>
-      listInstanceUsers({
-        search: query.search,
-        kind: query.kind ?? 'human',
-        limit: query.limit ?? 50,
-        offset: query.offset ?? 0,
-      }),
+      paginate(query, (window) =>
+        listInstanceUsers({ search: query.search, kind: query.kind ?? 'human', ...window }),
+      ),
     {
       query: listUsersQuery,
-      response: { 200: InstanceUserListResponse, ...errors(400, 401, 403) },
+      response: { 200: InstanceUserPageResponse, ...errors(400, 401, 403) },
       detail: {
         summary: 'List instance users',
         description:
-          'List one page of accounts, with the global role and sign-in state of each, plus how many match the filters.',
+          'One page of accounts, with the global role and sign-in state of each, plus how many match the filters.',
       },
     },
   )
@@ -524,21 +592,24 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
   .get(
     '/god/projects',
     ({ query }) =>
-      listInstanceProjects({
-        search: query.search,
-        limit: query.limit ?? 50,
-        offset: query.offset ?? 0,
-      }),
+      paginate(query, (window) => listInstanceProjects({ search: query.search, ...window })),
     {
-      query: listProjectsQuery,
-      response: { 200: InstanceProjectListResponse, ...errors(400, 401, 403) },
+      query: searchPageQuery,
+      response: { 200: InstanceProjectPageResponse, ...errors(400, 401, 403) },
       detail: {
         summary: 'List instance projects',
-        description:
-          'List one page of projects with what each holds, plus how many match the search.',
+        description: 'One page of projects with what each holds, plus how many match the search.',
       },
     },
   )
+
+  .get('/god/projects/options', () => listInstanceProjectOptions(), {
+    response: { 200: InstanceProjectOptionListResponse, ...errors(401, 403) },
+    detail: {
+      summary: 'List every instance project',
+      description: 'Every project on the instance as id, key and name, for a picker.',
+    },
+  })
 
   .get(
     '/god/projects/:projectId',
@@ -554,6 +625,71 @@ export const godRoutes = new Elysia({ name: 'god', detail: { tags: ['God'] } })
         summary: 'Get an instance project',
         description:
           'Get one project with what it holds and every member, with the permissions each membership resolves to.',
+      },
+    },
+  )
+
+  .get(
+    '/god/teams',
+    ({ query }) =>
+      paginate(query, (window) => listInstanceTeams({ search: query.search, ...window })),
+    {
+      query: searchPageQuery,
+      response: { 200: InstanceTeamPageResponse, ...errors(400, 401, 403) },
+      detail: {
+        summary: 'List instance teams',
+        description: 'One page of teams with what each holds, plus how many match the search.',
+      },
+    },
+  )
+
+  .get(
+    '/god/teams/:teamId',
+    async ({ params }) => {
+      const found = await getInstanceTeam(params.teamId);
+      if (!found) throw new HttpError(404, 'Team not found');
+      return found;
+    },
+    {
+      params: teamParams,
+      response: { 200: InstanceTeamResponse, ...commonErrors },
+      detail: {
+        summary: 'Get an instance team',
+        description: 'Get one team with what it holds. Its projects and members are paged apart.',
+      },
+    },
+  )
+
+  .get(
+    '/god/teams/:teamId/projects',
+    ({ params, query }) =>
+      paginate(query, (window) =>
+        listInstanceTeamProjects(params.teamId, { search: query.search, ...window }),
+      ),
+    {
+      params: teamParams,
+      query: searchPageQuery,
+      response: { 200: InstanceTeamProjectPageResponse, ...commonErrors },
+      detail: {
+        summary: "List a team's projects",
+        description: 'One page of the projects a team owns, with what each holds.',
+      },
+    },
+  )
+
+  .get(
+    '/god/teams/:teamId/members',
+    ({ params, query }) =>
+      paginate(query, (window) =>
+        listInstanceTeamMembers(params.teamId, { search: query.search, ...window }),
+      ),
+    {
+      params: teamParams,
+      query: searchPageQuery,
+      response: { 200: InstanceTeamMemberPageResponse, ...commonErrors },
+      detail: {
+        summary: "List a team's members",
+        description: 'One page of the team members, people and agents alike, with their rank.',
       },
     },
   );
