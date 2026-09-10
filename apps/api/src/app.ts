@@ -4,20 +4,17 @@ import {
   oAuthProtectedResourceMetadata,
   trustedOrigins,
   getAuthSettings,
-  hasConfiguredEmailProvider,
   hasConfiguredGoogle,
   hasConfiguredOidc,
   getOidcLabel,
 } from '@repo/auth';
+import { hasConfiguredEmailProvider } from '@repo/db';
 import { cors } from '@elysiajs/cors';
 import { swagger } from '@elysiajs/swagger';
 import { Elysia } from 'elysia';
 import { planner } from './planner';
 import { mountMcp } from './mcp/mount';
 import { setMcpApp } from './mcp/app-ref';
-import { internalAgentRunRoutes } from './modules/agents/core/internal-routes';
-import { internalNotificationRoutes } from './modules/notifications/internal-routes';
-import { internalTelegramRoutes } from './modules/telegram/internal-routes';
 import { gitWebhookRoutes } from './modules/git/webhook';
 import { scimRoutes } from './modules/scim';
 import { syncOidcGroupsAfterCallback } from './modules/scim/oidc-sync';
@@ -166,11 +163,6 @@ export const app = new Elysia()
             name: 'System',
             description: 'Liveness, the current session user, and the instance sign-in policy',
           },
-          {
-            name: 'Internal',
-            description:
-              'Endpoints the worker and the bot call with the shared WORKER_INTERNAL_TOKEN',
-          },
         ],
         // Planner routes are session-gated. Besides the session cookie (sent by the
         // browser, not modelled here), a request may carry an `x-api-key` header:
@@ -185,12 +177,6 @@ export const app = new Elysia()
               scheme: 'bearer',
               bearerFormat: 'opaque',
               description: 'Instance SCIM token generated in God mode.',
-            },
-            workerToken: {
-              type: 'apiKey',
-              in: 'header',
-              name: 'x-worker-token',
-              description: 'Shared token used only by the worker and bot services.',
             },
             gitHubSignature: {
               type: 'apiKey',
@@ -313,9 +299,6 @@ export const app = new Elysia()
       description: 'Liveness probe: returns the api name and `status: "ok"`.',
     },
   })
-  .use(internalAgentRunRoutes)
-  .use(internalNotificationRoutes)
-  .use(internalTelegramRoutes)
   // Inbound repository webhook receiver (authenticated by its per-project secret).
   .use(gitWebhookRoutes)
   // SCIM 2.0 provisioning (authenticated by the instance SCIM bearer token). Mounted
